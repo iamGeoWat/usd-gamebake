@@ -5,8 +5,9 @@ Turn production OpenUSD assets into game-ready glTF through Godot: import with a
 triangle no one can see, and keep only the lightest result that passes measured quality gates.
 
 It exists because there was no cross-platform, open-source tool for the "make this CAD-grade USD prop cheap enough for
-a game" step. The optimizers that do this are closed or tied to one vendor's platform, and no open-source tool removed
-hidden geometry per triangle.
+a game" step. The optimizers that do this are closed or tied to one vendor's platform. The open-source glTF / USD
+optimizers we looked at (gltfpack, glTF-Transform, usd-optimize) have no per-triangle hidden-geometry removal step;
+usd-optimize's occlusion works per prim.
 
 ## What is in here
 
