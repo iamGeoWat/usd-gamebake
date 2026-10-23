@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+/_src/
+/_work/
+/build/
+/extern/godot-cpp/
+/godot/project/.godot/
+/godot/project/gamebake_assets/
+/godot/project/bin/*.dylib
+/godot/project/bin/*.so
+/godot/project/bin/*.dll
+.DS_Store

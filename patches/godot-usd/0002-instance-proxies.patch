@@ -1,0 +1,44 @@
+diff --git a/src/usd_scene_loader.cpp b/src/usd_scene_loader.cpp
+index 5e4bd57..cd1e3d3 100644
+--- a/src/usd_scene_loader.cpp
++++ b/src/usd_scene_loader.cpp
+@@ -2351,7 +2351,7 @@ class UsdSceneBuilder {
+ 	Transform3D get_stage_correction_transform() const {
+ 		Basis root_basis;
+ 		if (up_axis == UsdGeomTokens->z) {
+-			root_basis = Basis(Vector3(1, 0, 0), (real_t)-Math_PI * 0.5);
++			root_basis = Basis(Vector3(1, 0, 0), (real_t)-Math::PI * 0.5);
+ 		}
+ 		root_basis = root_basis.scaled(Vector3((real_t)meters_per_unit, (real_t)meters_per_unit, (real_t)meters_per_unit));
+ 		return Transform3D(root_basis, Vector3());
+@@ -2788,7 +2788,7 @@ class UsdSceneBuilder {
+ 		store_composition_arcs(p_prim, node);
+ 		apply_transform_and_visibility(p_prim, node);
+ 
+-		for (const UsdPrim &child_prim : p_prim.GetChildren()) {
++		for (const UsdPrim &child_prim : p_prim.GetFilteredChildren(UsdTraverseInstanceProxies())) {  // walk instance proxies (instanceable prims are common in production assets)
+ 			if (should_skip_child_prim(child_prim)) {
+ 				continue;
+ 			}
+diff --git a/src/usd_stage_utils.cpp b/src/usd_stage_utils.cpp
+index 1259895..8a1c56a 100644
+--- a/src/usd_stage_utils.cpp
++++ b/src/usd_stage_utils.cpp
+@@ -168,7 +168,7 @@ void collect_variant_sets_for_prim(const UsdPrim &p_prim, Dictionary *r_variant_
+ 		}
+ 	}
+ 
+-	for (const UsdPrim &child : p_prim.GetChildren()) {
++	for (const UsdPrim &child : p_prim.GetFilteredChildren(UsdTraverseInstanceProxies())) {
+ 		collect_variant_sets_for_prim(child, r_variant_catalog);
+ 	}
+ 
+@@ -184,7 +184,7 @@ void collect_variant_sets_for_prim(const UsdPrim &p_prim, Dictionary *r_variant_
+ 			if (!variant_set.SetVariantSelection(variant_name)) {
+ 				continue;
+ 			}
+-			for (const UsdPrim &child : p_prim.GetChildren()) {
++			for (const UsdPrim &child : p_prim.GetFilteredChildren(UsdTraverseInstanceProxies())) {
+ 				collect_variant_sets_for_prim(child, r_variant_catalog);
+ 			}
+ 		}

@@ -1,0 +1,101 @@
+diff --git a/src/usd_materials.cpp b/src/usd_materials.cpp
+index 2ab87c9..8823ede 100644
+--- a/src/usd_materials.cpp
++++ b/src/usd_materials.cpp
+@@ -314,6 +314,17 @@ UsdShaderConnection get_connected_texture_shader(const UsdStageRefPtr &p_stage,
+ 	return connection;
+ }
+ 
++
++// a UDIM atlas maps through the material's uv1 transform (the mesh builder writes v = 1 - v_usd)
++static void apply_udim_uv(StandardMaterial3D *p_material) {
++	const Vector2i grid = usd_udim_last_grid();
++	if (p_material == nullptr || grid.x <= 0 || grid.y <= 0) {
++		return;
++	}
++	p_material->set_uv1_scale(Vector3(1.0f / grid.x, 1.0f / grid.y, 1.0f));
++	p_material->set_uv1_offset(Vector3(0.0f, float(grid.y - 1) / grid.y, 0.0f));
++}
++
+ Ref<Image> load_image_from_shader(const UsdStageRefPtr &p_stage, const UsdTimeCode &p_time, const UsdShadeShader &p_shader, String *r_resolved_path) {
+ 	UsdShadeInput file_input = p_shader.GetInput(TfToken("file"));
+ 	if (!file_input) {
+@@ -488,14 +499,18 @@ Ref<Material> build_material_from_usd_material(const UsdStageRefPtr &p_stage, co
+ 	if (diffuse_input) {
+ 		GfVec3f diffuse_color(1.0f, 1.0f, 1.0f);
+ 		diffuse_input.Get(&diffuse_color, p_time);
+-		material->set_albedo(Color(diffuse_color[0], diffuse_color[1], diffuse_color[2], 1.0f));
++		// UsdPreviewSurface colours are LINEAR; BaseMaterial3D's albedo is an sRGB source_color (the forklift's linear
++		// orange (0.8, 0.18, 0) rendered dark red until converted)
++		material->set_albedo(Color(diffuse_color[0], diffuse_color[1], diffuse_color[2], 1.0f).linear_to_srgb());
+ 
+ 		const UsdShaderConnection texture_connection = get_connected_texture_shader(p_stage, p_time, diffuse_input);
+ 		if (texture_connection) {
+ 			record_preview_texture_source(p_stage, p_time, &texture_sources, "diffuseColor", texture_connection);
+ 			Ref<Texture2D> texture = load_texture_from_shader(p_stage, p_time, texture_connection.shader);
+ 			if (texture.is_valid()) {
+-				material->set_texture(BaseMaterial3D::TEXTURE_ALBEDO, texture);
++				// a connected input ignores its authored value (UsdShadeInput): no tint over the texture
++				material->set_albedo(Color(1.0f, 1.0f, 1.0f, material->get_albedo().a));
++				material->set_texture(BaseMaterial3D::TEXTURE_ALBEDO, texture); apply_udim_uv(material.ptr());
+ 				merge_material_uv_transform(p_stage, p_time, texture_connection.shader, material.ptr(), &has_uv_transform, &uv_scale, &uv_offset, r_mapping_notes);
+ 			}
+ 		} else if (diffuse_input.HasConnectedSource() && r_mapping_notes != nullptr) {
+@@ -514,7 +529,10 @@ Ref<Material> build_material_from_usd_material(const UsdStageRefPtr &p_stage, co
+ 			record_preview_texture_source(p_stage, p_time, &texture_sources, "metallic", texture_connection);
+ 			Ref<Texture2D> texture = load_texture_from_shader(p_stage, p_time, texture_connection.shader);
+ 			if (texture.is_valid()) {
+-				material->set_texture(BaseMaterial3D::TEXTURE_METALLIC, texture);
++				// Godot multiplies the metallic SCALAR into the texture; a connected input has no authored value, so the
++				// default 0 zeroed every metal map (chrome rendered as white plastic). The texture carries the value: scalar 1.
++				material->set_metallic(1.0f);
++				material->set_texture(BaseMaterial3D::TEXTURE_METALLIC, texture); apply_udim_uv(material.ptr());
+ 				material->set_metallic_texture_channel(get_texture_channel_for_output(texture_connection.output_name));
+ 				merge_material_uv_transform(p_stage, p_time, texture_connection.shader, material.ptr(), &has_uv_transform, &uv_scale, &uv_offset, r_mapping_notes);
+ 			}
+@@ -534,7 +552,8 @@ Ref<Material> build_material_from_usd_material(const UsdStageRefPtr &p_stage, co
+ 			record_preview_texture_source(p_stage, p_time, &texture_sources, "roughness", texture_connection);
+ 			Ref<Texture2D> texture = load_texture_from_shader(p_stage, p_time, texture_connection.shader);
+ 			if (texture.is_valid()) {
+-				material->set_texture(BaseMaterial3D::TEXTURE_ROUGHNESS, texture);
++				material->set_roughness(1.0f);   // as metallic: the texture carries the value (an authored constant would scale it)
++				material->set_texture(BaseMaterial3D::TEXTURE_ROUGHNESS, texture); apply_udim_uv(material.ptr());
+ 				material->set_roughness_texture_channel(get_texture_channel_for_output(texture_connection.output_name));
+ 				merge_material_uv_transform(p_stage, p_time, texture_connection.shader, material.ptr(), &has_uv_transform, &uv_scale, &uv_offset, r_mapping_notes);
+ 			}
+@@ -551,7 +570,7 @@ Ref<Material> build_material_from_usd_material(const UsdStageRefPtr &p_stage, co
+ 			Ref<Texture2D> texture = load_texture_from_shader(p_stage, p_time, texture_connection.shader);
+ 			if (texture.is_valid()) {
+ 				material->set_feature(BaseMaterial3D::FEATURE_NORMAL_MAPPING, true);
+-				material->set_texture(BaseMaterial3D::TEXTURE_NORMAL, texture);
++				material->set_texture(BaseMaterial3D::TEXTURE_NORMAL, texture); apply_udim_uv(material.ptr());
+ 				merge_material_uv_transform(p_stage, p_time, texture_connection.shader, material.ptr(), &has_uv_transform, &uv_scale, &uv_offset, r_mapping_notes);
+ 			}
+ 		} else if (r_mapping_notes != nullptr) {
+@@ -603,7 +622,7 @@ Ref<Material> build_material_from_usd_material(const UsdStageRefPtr &p_stage, co
+ 	UsdShadeInput emission_input = preview_surface.GetInput(TfToken("emissiveColor"));
+ 	bool has_emission = false;
+ 	if (emission_input && emission_input.Get(&emission, p_time)) {
+-		const Color emission_color(emission[0], emission[1], emission[2], 1.0f);
++		const Color emission_color = Color(emission[0], emission[1], emission[2], 1.0f).linear_to_srgb();   // linear -> sRGB, as albedo
+ 		if (emission_color.r > 0.0f || emission_color.g > 0.0f || emission_color.b > 0.0f) {
+ 			material->set_emission(emission_color);
+ 			has_emission = true;
+@@ -767,7 +786,7 @@ bool write_preview_material(const UsdStageRefPtr &p_stage, const Ref<Material> &
+ 	preview_surface.CreateIdAttr(VtValue(TfToken("UsdPreviewSurface")));
+ 	usd_material.CreateSurfaceOutput().ConnectToSource(preview_surface.CreateOutput(TfToken("surface"), SdfValueTypeNames->Token));
+ 
+-	const Color albedo = base_material->get_albedo();
++	const Color albedo = base_material->get_albedo().srgb_to_linear();   // back to USD's linear
+ 	const Dictionary material_metadata = get_usd_metadata(base_material);
+ 	const bool use_specular_workflow = (bool)material_metadata.get("usd:preview_surface_use_specular_workflow", false);
+ 	const Variant ior_variant = material_metadata.get("usd:preview_surface_ior", Variant());
+@@ -794,7 +813,7 @@ bool write_preview_material(const UsdStageRefPtr &p_stage, const Ref<Material> &
+ 			base_material->get_texture(BaseMaterial3D::TEXTURE_EMISSION).is_valid() ||
+ 			base_material->get_emission() != Color(0.0f, 0.0f, 0.0f, 1.0f);
+ 	if (has_emission) {
+-		const Color emission = base_material->get_emission();
++		const Color emission = base_material->get_emission().srgb_to_linear();
+ 		preview_surface.CreateInput(TfToken("emissiveColor"), SdfValueTypeNames->Color3f).Set(GfVec3f(emission.r, emission.g, emission.b));
+ 	}
+ 

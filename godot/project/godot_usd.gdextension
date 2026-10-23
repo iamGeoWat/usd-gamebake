@@ -1,0 +1,17 @@
+[configuration]
+
+entry_symbol = "godot_usd_library_init"
+compatibility_minimum = "4.3"
+reloadable = false
+
+[libraries]
+
+; A standard (single-precision) Godot editor loads the plain builds; a precision=double editor loads the .double ones.
+; Build the one matching your editor (scripts/build_extension.sh) and copy it into bin/.
+; The .double entries come first: a double editor also matches the plain tags, and the first match wins.
+macos.debug.double.arm64 = "res://bin/libgodot_usd.macos.template_debug.double.arm64.dylib"
+linux.debug.double.x86_64 = "res://bin/libgodot_usd.linux.template_debug.double.x86_64.so"
+windows.debug.double.x86_64 = "res://bin/libgodot_usd.windows.template_debug.double.x86_64.dll"
+macos.debug.arm64 = "res://bin/libgodot_usd.macos.template_debug.arm64.dylib"
+linux.debug.x86_64 = "res://bin/libgodot_usd.linux.template_debug.x86_64.so"
+windows.debug.x86_64 = "res://bin/libgodot_usd.windows.template_debug.x86_64.dll"

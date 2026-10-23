@@ -1,0 +1,8 @@
+; usd-gamebake tools project: the place the patched godot-usd importer bakes USD assets.
+; Put the built extension library in bin/ (see README). Assets are copied under gamebake_assets/ by `gamebake bake`.
+
+config_version=5
+
+[application]
+
+config/name="usd-gamebake tools"

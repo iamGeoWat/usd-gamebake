@@ -1,0 +1,116 @@
+diff --git a/src/usd_usdz.cpp b/src/usd_usdz.cpp
+index 0aa995f..1a8c4b5 100644
+--- a/src/usd_usdz.cpp
++++ b/src/usd_usdz.cpp
+@@ -1,3 +1,8 @@
++#include <godot_cpp/templates/hash_map.hpp>
++#include <pxr/usd/sdf/propertySpec.h>
++#include <vector>
++#include <godot_cpp/classes/project_settings.hpp>
++#include <godot_cpp/classes/resource_loader.hpp>
+ #include "usd_usdz.h"
+ 
+ #include <godot_cpp/classes/dir_access.hpp>
+@@ -173,7 +178,89 @@ Ref<Texture2D> texture_from_image(const Ref<Image> &p_image) {
+ 	return ImageTexture::create_from_image(p_image);
+ }
+ 
++
++// UDIM. A texture path with <UDIM> becomes ONE atlas of the tiles on disk (1001 = u0 v0, 1002 = u1 v0,
++// 1011 = u0 v1 ...); the material maps it with uv1_scale / uv1_offset (see usd_udim_last_grid), so mesh UVs stay untouched.
++static thread_local Vector2i g_udim_last_grid = Vector2i();
++Vector2i usd_udim_last_grid() {
++	return g_udim_last_grid;
++}
++static thread_local HashMap<String, Ref<Texture2D>> g_udim_atlas_cache;   // one atlas per tile pattern
++static thread_local HashMap<String, Vector2i> g_udim_grid_cache;
++void usd_udim_cache_clear() {
++	g_udim_atlas_cache.clear();
++	g_udim_grid_cache.clear();
++}
++static Ref<Texture2D> load_udim_atlas(const String &p_pattern) {
++	if (g_udim_atlas_cache.has(p_pattern)) {
++		g_udim_last_grid = g_udim_grid_cache[p_pattern];
++		return g_udim_atlas_cache[p_pattern];
++	}
++	struct Tile { int u; int v; Ref<Image> img; };
++	std::vector<Tile> tiles;
++	int cols = 0, rows = 0, tw = 0, th = 0;
++	for (int id = 1001; id <= 1100; id++) {
++		const String path = p_pattern.replace("<UDIM>", itos(id));
++		if (!FileAccess::file_exists(path)) {
++			continue;
++		}
++		Ref<Image> img = Image::load_from_file(path);
++		if (img.is_null()) {
++			continue;
++		}
++		const int u = (id - 1001) % 10, v = (id - 1001) / 10;
++		if (img->is_compressed()) { img->decompress(); }
++		img->convert(Image::FORMAT_RGBA8);
++		tw = MAX(tw, img->get_width()); th = MAX(th, img->get_height());
++		cols = MAX(cols, u + 1); rows = MAX(rows, v + 1);
++		tiles.push_back({ u, v, img });
++	}
++	if (tiles.empty()) {
++		g_udim_last_grid = Vector2i();
++		return Ref<Texture2D>();
++	}
++	Ref<Image> atlas = Image::create_empty(tw * cols, th * rows, false, Image::FORMAT_RGBA8);
++	for (const Tile &tile : tiles) {
++		Ref<Image> img = tile.img;
++		if (img->get_width() != tw || img->get_height() != th) { img->resize(tw, th, Image::INTERPOLATE_BILINEAR); }
++		atlas->blit_rect(img, Rect2i(0, 0, tw, th), Vector2i(tile.u * tw, (rows - 1 - tile.v) * th));   // USD row v sits (rows-1-v) from the top
++	}
++	atlas->generate_mipmaps();
++	g_udim_last_grid = Vector2i(cols, rows);
++	Ref<Texture2D> tex = ImageTexture::create_from_image(atlas);
++	g_udim_atlas_cache[p_pattern] = tex;
++	g_udim_grid_cache[p_pattern] = g_udim_last_grid;
++	return tex;
++}
++
+ Ref<Texture2D> load_texture_from_asset_attribute(const UsdStageRefPtr &p_stage, const UsdTimeCode &p_time, const UsdAttribute &p_asset_attribute, String *r_resolved_path) {
++	// a texture file inside the project is the project's IMPORTED texture (VRAM compression, mipmaps), not a raw image
++	g_udim_last_grid = Vector2i();
++	SdfAssetPath asset_path;
++	if (p_asset_attribute && p_asset_attribute.Get(&asset_path, p_time)) {
++		const String authored = String::utf8(asset_path.GetAssetPath().c_str());
++		if (authored.contains("<UDIM>")) {   // tiles -> one atlas
++			const SdfLayerHandle layer = p_asset_attribute.GetPropertyStack().empty() ? SdfLayerHandle() : p_asset_attribute.GetPropertyStack().front()->GetLayer();
++			const String layer_dir = layer ? String::utf8(layer->GetRealPath().c_str()).get_base_dir() : String();
++			const String pattern = authored.is_absolute_path() ? authored : layer_dir.path_join(authored).simplify_path();
++			Ref<Texture2D> atlas = load_udim_atlas(pattern);
++			if (atlas.is_valid()) {
++				if (r_resolved_path != nullptr) { *r_resolved_path = pattern; }
++				return atlas;
++			}
++		}
++		const String resolved = resolve_asset_path(p_stage, asset_path);
++		const String local = resolved.is_empty() ? String() : ProjectSettings::get_singleton()->localize_path(resolved);
++		if (local.begins_with("res://") && ResourceLoader::get_singleton()->exists(local, "Texture2D")) {
++			Ref<Texture2D> imported = ResourceLoader::get_singleton()->load(local, "Texture2D");
++			if (imported.is_valid()) {
++				if (r_resolved_path != nullptr) {
++					*r_resolved_path = resolved;
++				}
++				return imported;   // no decode: the importer already made it
++			}
++		}
++	}
+ 	return texture_from_image(load_image_from_asset_attribute(p_stage, p_time, p_asset_attribute, r_resolved_path));
+ }
+ 
+diff --git a/src/usd_usdz.h b/src/usd_usdz.h
+index d0e2d77..1909615 100644
+--- a/src/usd_usdz.h
++++ b/src/usd_usdz.h
+@@ -25,6 +25,8 @@ String resolve_asset_path(const UsdStageRefPtr &p_stage, const SdfAssetPath &p_a
+ Ref<Image> load_image_from_asset_attribute(const UsdStageRefPtr &p_stage, const UsdTimeCode &p_time, const UsdAttribute &p_asset_attribute, String *r_resolved_path = nullptr);
+ Ref<Texture2D> texture_from_image(const Ref<Image> &p_image);
+ Ref<Texture2D> load_texture_from_asset_attribute(const UsdStageRefPtr &p_stage, const UsdTimeCode &p_time, const UsdAttribute &p_asset_attribute, String *r_resolved_path = nullptr);
++godot::Vector2i usd_udim_last_grid();   // the last texture load's UDIM grid (0,0 = not UDIM)
++void usd_udim_cache_clear();   // clears the per-import UDIM atlas cache
+ bool is_safe_usdz_member_path(const String &p_member_path);
+ Error extract_usdz_package(const String &p_source_absolute_path, const String &p_destination_directory, String *r_root_layer_path, Vector<String> *r_package_file_paths);
+ Error create_usdz_package_from_extracted_files(const String &p_extracted_directory, const Vector<String> &p_package_file_paths, const String &p_root_layer_path, const String &p_package_path);

@@ -1,0 +1,3 @@
+[submodule "extern/godot-usd"]
+	path = extern/godot-usd
+	url = https://github.com/migueldeicaza/godot-usd

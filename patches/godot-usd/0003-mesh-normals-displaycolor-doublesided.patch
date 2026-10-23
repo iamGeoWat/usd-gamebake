@@ -1,0 +1,82 @@
+diff --git a/src/usd_mesh_builder.cpp b/src/usd_mesh_builder.cpp
+index 784fa63..8d578b0 100644
+--- a/src/usd_mesh_builder.cpp
++++ b/src/usd_mesh_builder.cpp
+@@ -568,7 +568,7 @@ void store_skin_binding_metadata(const UsdStageRefPtr &p_stage, const UsdTimeCod
+ 		Transform3D stage_correction;
+ 		const TfToken up_axis = UsdGeomGetStageUpAxis(p_stage);
+ 		if (up_axis == UsdGeomTokens->z) {
+-			stage_correction = Transform3D(Basis(Vector3(1, 0, 0), (real_t)-Math_PI * 0.5).scaled(Vector3(UsdGeomGetStageMetersPerUnit(p_stage), UsdGeomGetStageMetersPerUnit(p_stage), UsdGeomGetStageMetersPerUnit(p_stage))), Vector3());
++			stage_correction = Transform3D(Basis(Vector3(1, 0, 0), (real_t)-Math::PI * 0.5).scaled(Vector3(UsdGeomGetStageMetersPerUnit(p_stage), UsdGeomGetStageMetersPerUnit(p_stage), UsdGeomGetStageMetersPerUnit(p_stage))), Vector3());
+ 		} else {
+ 			stage_correction = Transform3D(Basis().scaled(Vector3(UsdGeomGetStageMetersPerUnit(p_stage), UsdGeomGetStageMetersPerUnit(p_stage), UsdGeomGetStageMetersPerUnit(p_stage))), Vector3());
+ 		}
+@@ -595,15 +595,21 @@ MeshBuildResult build_polygon_mesh(const UsdStageRefPtr &p_stage, const UsdTimeC
+ 	UsdGeomGprim gprim(p_mesh.GetPrim());
+ 	gprim.GetOrientationAttr().Get(&orientation, p_time);
+ 
+-	UsdGeomPrimvar normals_primvar(p_mesh.GetNormalsAttr());
+-	if (!normals_primvar || !normals_primvar.HasValue()) {
+-		normals_primvar = find_normals_primvar(p_mesh);
+-	}
++	// UsdGeomPrimvar(GetNormalsAttr()) is never valid -- `normals` is a plain PointBased attribute, not
++	// in the primvars: namespace -- so authored normals were ignored and every mesh got the generated (faceted) fallback. USD's
++	// rule: primvars:normals wins when authored, else the `normals` attribute with GetNormalsInterpolation().
++	UsdGeomPrimvar normals_primvar = find_normals_primvar(p_mesh);
+ 	VtArray<GfVec3f> normals_values;
+ 	TfToken normals_interpolation = UsdGeomTokens->vertex;
+-	const bool has_normals = normals_primvar && normals_primvar.ComputeFlattened(&normals_values, p_time);
++	bool has_normals = normals_primvar && normals_primvar.HasValue() && normals_primvar.ComputeFlattened(&normals_values, p_time);
+ 	if (has_normals) {
+ 		normals_interpolation = normals_primvar.GetInterpolation();
++	} else {
++		const UsdAttribute normals_attr = p_mesh.GetNormalsAttr();
++		has_normals = normals_attr && normals_attr.HasValue() && normals_attr.Get(&normals_values, p_time) && !normals_values.empty();
++		if (has_normals) {
++			normals_interpolation = p_mesh.GetNormalsInterpolation();
++		}
+ 	}
+ 
+ 	UsdGeomPrimvar uv_primvar = find_uv_primvar(p_mesh);
+@@ -762,7 +768,9 @@ MeshBuildResult build_polygon_mesh(const UsdStageRefPtr &p_stage, const UsdTimeC
+ 				c = point1;
+ 			}
+ 
+-			Vector3 generated_normal = (b - a).cross(c - a);
++			// (a, b, c) is Godot's CLOCKWISE front order here, so the outward face normal is (c - a) x (b - a); the old (b - a) x (c - a)
++			// pointed every generated normal INTO the surface (dark, lit-from-behind props).
++			Vector3 generated_normal = (c - a).cross(b - a);
+ 			if (generated_normal.length_squared() > 0.0f) {
+ 				generated_normal.normalize();
+ 			}
+@@ -805,7 +813,11 @@ MeshBuildResult build_polygon_mesh(const UsdStageRefPtr &p_stage, const UsdTimeC
+ 		if (!surface.uvs.is_empty()) {
+ 			arrays[Mesh::ARRAY_TEX_UV] = surface.uvs;
+ 		}
+-		if (!surface.colors.is_empty()) {
++		// displayColor is the fallback for an UNBOUND gprim (UsdGeomGprim); a bound material that does not read
++		// vertex colours must not inherit it, or a glTF round trip multiplies it into the albedo (a drum's cap went green).
++		const Ref<BaseMaterial3D> surface_base_material = surface.material;
++		const bool surface_reads_colors = surface.material.is_null() || (surface_base_material.is_valid() && surface_base_material->get_flag(BaseMaterial3D::FLAG_ALBEDO_FROM_VERTEX_COLOR));
++		if (!surface.colors.is_empty() && surface_reads_colors) {
+ 			arrays[Mesh::ARRAY_COLOR] = surface.colors;
+ 		}
+ 		if (!surface.bones.is_empty()) {
+@@ -825,6 +837,17 @@ MeshBuildResult build_polygon_mesh(const UsdStageRefPtr &p_stage, const UsdTimeC
+ 		} else if (surface_material.is_null() && has_display_color) {
+ 			surface_material = make_display_color_material(Color(1.0f, 1.0f, 1.0f, 1.0f), true);
+ 		}
++		// UsdGeomGprim doubleSided -> render both faces. Godot culls back faces by default, so a double-sided
++		// surface authored facing inward vanished (a cabinet asset: its black rubber band showed the white body behind it). The
++		// material is DUPLICATED, so a single-sided mesh sharing it keeps its culling.
++		bool double_sided = false;
++		gprim.GetDoubleSidedAttr().Get(&double_sided, p_time);
++		const Ref<BaseMaterial3D> base_surface_material = surface_material;
++		if (double_sided && base_surface_material.is_valid() && base_surface_material->get_cull_mode() != BaseMaterial3D::CULL_DISABLED) {
++			Ref<BaseMaterial3D> two_sided = base_surface_material->duplicate();
++			two_sided->set_cull_mode(BaseMaterial3D::CULL_DISABLED);
++			surface_material = two_sided;
++		}
+ 		if (surface_material.is_valid()) {
+ 			mesh->surface_set_material(mesh->get_surface_count() - 1, surface_material);
+ 		}

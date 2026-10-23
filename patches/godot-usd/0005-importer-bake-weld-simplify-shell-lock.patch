@@ -1,0 +1,452 @@
+diff --git a/src/usd_scene_importer.cpp b/src/usd_scene_importer.cpp
+index 83d3eeb..def3118 100644
+--- a/src/usd_scene_importer.cpp
++++ b/src/usd_scene_importer.cpp
+@@ -1,6 +1,15 @@
+ #include "usd_scene_importer.h"
+ 
+ #include <godot_cpp/classes/json.hpp>
++#include <godot_cpp/classes/array_mesh.hpp>
++#include <godot_cpp/classes/importer_mesh.hpp>
++#include <godot_cpp/classes/importer_mesh_instance3d.hpp>
++#include <godot_cpp/classes/mesh_instance3d.hpp>
++#include <godot_cpp/classes/material.hpp>
++#include <godot_cpp/classes/skin.hpp>
++#include <godot_cpp/classes/surface_tool.hpp>
++#include <unordered_map>
++#include <vector>
+ #include <godot_cpp/classes/node.hpp>
+ #include <godot_cpp/classes/packed_scene.hpp>
+ #include <godot_cpp/classes/resource_loader.hpp>
+@@ -12,6 +21,8 @@
+ #include <godot_cpp/variant/utility_functions.hpp>
+ 
+ #include "usd_scene_loader.h"
++#include "usd_usdz.h"
++#include "usd_stage_utils.h"
+ 
+ using namespace godot;
+ 
+@@ -138,6 +149,377 @@ bool parse_import_variant_selections(const Dictionary &p_options, Dictionary *r_
+ 	return true;
+ }
+ 
++
++
++// the base-mesh budget. Godot's import LODs only help at distance; a production prop needs its LOD0 inside the
++// target budget too. Generate meshoptimizer LODs (Godot's own), take the first whose index count is <= ratio x the base, compact
++// the vertex arrays to the used vertices, and hand that to the pipeline as the new base (it builds its distance LODs from it).
++Array compact_surface_arrays(const Array &p_arrays, const PackedInt32Array &p_indices) {
++	const PackedVector3Array verts = p_arrays[Mesh::ARRAY_VERTEX];
++	const int vcount = verts.size();
++	PackedInt32Array remap;
++	remap.resize(vcount);
++	remap.fill(-1);
++	PackedInt32Array order;
++	PackedInt32Array new_indices;
++	new_indices.resize(p_indices.size());
++	for (int i = 0; i < p_indices.size(); i++) {
++		const int v = p_indices[i];
++		if (remap[v] < 0) {
++			remap.set(v, order.size());
++			order.push_back(v);
++		}
++		new_indices.set(i, remap[v]);
++	}
++	Array out;
++	out.resize(Mesh::ARRAY_MAX);
++	for (int slot = 0; slot < Mesh::ARRAY_MAX; slot++) {
++		if (slot == Mesh::ARRAY_INDEX) {
++			out[slot] = new_indices;
++			continue;
++		}
++		const Variant src = p_arrays[slot];
++		switch (src.get_type()) {
++			case Variant::PACKED_VECTOR3_ARRAY: {
++				const PackedVector3Array a = src; PackedVector3Array b; b.resize(order.size());
++				for (int i = 0; i < order.size(); i++) { b.set(i, a[order[i]]); }
++				out[slot] = b; break;
++			}
++			case Variant::PACKED_VECTOR2_ARRAY: {
++				const PackedVector2Array a = src; PackedVector2Array b; b.resize(order.size());
++				for (int i = 0; i < order.size(); i++) { b.set(i, a[order[i]]); }
++				out[slot] = b; break;
++			}
++			case Variant::PACKED_COLOR_ARRAY: {
++				const PackedColorArray a = src; PackedColorArray b; b.resize(order.size());
++				for (int i = 0; i < order.size(); i++) { b.set(i, a[order[i]]); }
++				out[slot] = b; break;
++			}
++			case Variant::PACKED_FLOAT32_ARRAY: {
++				const PackedFloat32Array a = src; const int stride = vcount > 0 ? a.size() / vcount : 0; PackedFloat32Array b; b.resize(order.size() * stride);
++				for (int i = 0; i < order.size(); i++) { for (int k = 0; k < stride; k++) { b.set(i * stride + k, a[order[i] * stride + k]); } }
++				out[slot] = b; break;
++			}
++			case Variant::PACKED_FLOAT64_ARRAY: {
++				const PackedFloat64Array a = src; const int stride = vcount > 0 ? a.size() / vcount : 0; PackedFloat64Array b; b.resize(order.size() * stride);
++				for (int i = 0; i < order.size(); i++) { for (int k = 0; k < stride; k++) { b.set(i * stride + k, a[order[i] * stride + k]); } }
++				out[slot] = b; break;
++			}
++			case Variant::PACKED_INT32_ARRAY: {
++				const PackedInt32Array a = src; const int stride = vcount > 0 ? a.size() / vcount : 0; PackedInt32Array b; b.resize(order.size() * stride);
++				for (int i = 0; i < order.size(); i++) { for (int k = 0; k < stride; k++) { b.set(i * stride + k, a[order[i] * stride + k]); } }
++				out[slot] = b; break;
++			}
++			case Variant::PACKED_BYTE_ARRAY: {
++				const PackedByteArray a = src; const int stride = vcount > 0 ? a.size() / vcount : 0; PackedByteArray b; b.resize(order.size() * stride);
++				for (int i = 0; i < order.size(); i++) { for (int k = 0; k < stride; k++) { b.set(i * stride + k, a[order[i] * stride + k]); } }
++				out[slot] = b; break;
++			}
++			default:
++				break;
++		}
++	}
++	return out;
++}
++
++// the mesh builder expands face-varying data per face corner, so every triangle owns three private vertices
++// (a 330k-triangle forklift asset: 990k vertices, a 52 MB GLB at full ratio). Weld vertices identical in EVERY attribute
++// (SurfaceTool::index), which changes neither the shape nor any seam; blend-shape meshes keep their arrays.
++Ref<ImporterMesh> weld_importer_mesh(const Ref<ImporterMesh> &p_mesh) {
++	if (p_mesh.is_null() || p_mesh->get_blend_shape_count() > 0) {
++		return p_mesh;
++	}
++	Ref<ImporterMesh> out;
++	out.instantiate();
++	out->set_name(p_mesh->get_name());
++	for (int s = 0; s < p_mesh->get_surface_count(); s++) {
++		Array arrays = p_mesh->get_surface_arrays(s);
++		if (p_mesh->get_surface_primitive_type(s) == Mesh::PRIMITIVE_TRIANGLES) {
++			Ref<SurfaceTool> st;
++			st.instantiate();
++			st->create_from_arrays(arrays, Mesh::PRIMITIVE_TRIANGLES);
++			st->deindex();   // index() is a no-op on an indexed surface, and the builder writes a trivial 0..n-1 index
++			st->index();
++			arrays = st->commit_to_arrays();
++		}
++		out->add_surface(p_mesh->get_surface_primitive_type(s), arrays, TypedArray<Array>(), Dictionary(), p_mesh->get_surface_material(s), p_mesh->get_surface_name(s), 0);
++	}
++	return out;
++}
++
++// SHELL LOCK. Layered surfaces (a label 0.3-1.5 mm over a body) are simplified one surface
++// at a time, so a body level that drifts more than the gap pokes through the shell (e.g. an extinguisher asset at 25 %). Before
++// simplifying, every triangle lying within usd/simplify_shell_lock metres of ANOTHER surface of the asset is marked near-shell
++// (both sides of the pair); those triangles are kept as authored and only the FREE set goes through generate_lods, whose
++// SIMPLIFY_LOCK_BORDER pins the seam between the two sets. Measured ceiling: 0.6-21.7 % of the area is layered on nine test
++// assets, so >= 78 % stays simplifiable.
++static std::unordered_map<uint64_t, std::vector<PackedByteArray>> g_shell_flags;   // MeshInstance3D id -> per-surface flags
++
++static Vector3 closest_on_triangle(const Vector3 &p, const Vector3 &a, const Vector3 &b, const Vector3 &c) {   // Ericson 5.1.5
++	const Vector3 ab = b - a, ac = c - a, ap = p - a;
++	const real_t d1 = ab.dot(ap), d2 = ac.dot(ap);
++	if (d1 <= 0 && d2 <= 0) return a;
++	const Vector3 bp = p - b; const real_t d3 = ab.dot(bp), d4 = ac.dot(bp);
++	if (d3 >= 0 && d4 <= d3) return b;
++	const real_t vc = d1 * d4 - d3 * d2;
++	if (vc <= 0 && d1 >= 0 && d3 <= 0) return a + ab * (d1 / (d1 - d3));
++	const Vector3 cp = p - c; const real_t d5 = ab.dot(cp), d6 = ac.dot(cp);
++	if (d6 >= 0 && d5 <= d6) return c;
++	const real_t vb = d5 * d2 - d1 * d6;
++	if (vb <= 0 && d2 >= 0 && d6 <= 0) return a + ac * (d2 / (d2 - d6));
++	const real_t va = d3 * d6 - d5 * d4;
++	if (va <= 0 && (d4 - d3) >= 0 && (d5 - d6) >= 0) return b + (c - b) * ((d4 - d3) / ((d4 - d3) + (d5 - d6)));
++	const real_t den = 1.0 / (va + vb + vc);
++	return a + ab * (vb * den) + ac * (vc * den);
++}
++
++static Transform3D chain_transform(Node *p_node) {
++	Transform3D xf;
++	for (Node *n = p_node; n != nullptr; n = n->get_parent()) {
++		if (Node3D *n3 = Object::cast_to<Node3D>(n)) {
++			xf = n3->get_transform() * xf;
++		}
++	}
++	return xf;
++}
++
++void compute_shell_flags(Node *p_root, double p_gap) {
++	g_shell_flags.clear();
++	if (p_gap <= 0.0) {
++		return;
++	}
++	struct Tri { Vector3 v[3]; int surf; int local; };
++	std::vector<Tri> tris;
++	std::vector<std::pair<uint64_t, int>> surf_of;   // surface id -> (MeshInstance3D id, surface index)
++	TypedArray<Node> mis = p_root->find_children("*", "MeshInstance3D", true, false);
++	for (int m = 0; m < mis.size(); m++) {
++		MeshInstance3D *mi = Object::cast_to<MeshInstance3D>(Object::cast_to<Node>(mis[m]));
++		if (mi == nullptr) continue;
++		Ref<ArrayMesh> am = mi->get_mesh();
++		if (am.is_null()) continue;
++		const Transform3D xf = chain_transform(mi);
++		std::vector<PackedByteArray> &flags = g_shell_flags[mi->get_instance_id()];
++		flags.resize(am->get_surface_count());
++		for (int s = 0; s < am->get_surface_count(); s++) {
++			if (am->surface_get_primitive_type(s) != Mesh::PRIMITIVE_TRIANGLES) continue;
++			const Array arrays = am->surface_get_arrays(s);
++			const PackedVector3Array verts = arrays[Mesh::ARRAY_VERTEX];
++			PackedInt32Array idx = arrays[Mesh::ARRAY_INDEX];
++			if (idx.is_empty()) { idx.resize(verts.size()); for (int i = 0; i < verts.size(); i++) idx.set(i, i); }
++			const int sid = (int)surf_of.size();
++			surf_of.push_back({ mi->get_instance_id(), s });
++			flags[s].resize(idx.size() / 3);
++			flags[s].fill(0);
++			for (int t = 0; t + 2 < idx.size(); t += 3) {
++				tris.push_back({ { xf.xform(verts[idx[t]]), xf.xform(verts[idx[t + 1]]), xf.xform(verts[idx[t + 2]]) }, sid, t / 3 });
++			}
++		}
++	}
++	const double cell = MAX(p_gap * 4.0, 0.01);
++	auto key = [](int64_t x, int64_t y, int64_t z) { return ((x & 0x1FFFFF) << 42) | ((y & 0x1FFFFF) << 21) | (z & 0x1FFFFF); };
++	std::unordered_map<int64_t, std::vector<int>> grid;
++	std::vector<int> large;   // triangles spanning too many cells: tested against every query
++	for (int i = 0; i < (int)tris.size(); i++) {
++		Vector3 lo = tris[i].v[0], hi = tris[i].v[0];
++		for (int k = 1; k < 3; k++) { lo = lo.min(tris[i].v[k]); hi = hi.max(tris[i].v[k]); }
++		lo -= Vector3(p_gap, p_gap, p_gap); hi += Vector3(p_gap, p_gap, p_gap);
++		const int64_t x0 = (int64_t)Math::floor(lo.x / cell), y0 = (int64_t)Math::floor(lo.y / cell), z0 = (int64_t)Math::floor(lo.z / cell);
++		const int64_t x1 = (int64_t)Math::floor(hi.x / cell), y1 = (int64_t)Math::floor(hi.y / cell), z1 = (int64_t)Math::floor(hi.z / cell);
++		if ((x1 - x0 + 1) * (y1 - y0 + 1) * (z1 - z0 + 1) > 512) { large.push_back(i); continue; }
++		for (int64_t x = x0; x <= x1; x++) for (int64_t y = y0; y <= y1; y++) for (int64_t z = z0; z <= z1; z++) grid[key(x, y, z)].push_back(i);
++	}
++	const double g2 = p_gap * p_gap;
++	auto mark = [&](int i) { const std::pair<uint64_t, int> &so = surf_of[tris[i].surf]; g_shell_flags[so.first][so.second].set(tris[i].local, 1); };
++	for (int i = 0; i < (int)tris.size(); i++) {
++		for (int k = 0; k < 3; k++) {
++			const Vector3 &p = tris[i].v[k];
++			const int64_t cx = (int64_t)Math::floor(p.x / cell), cy = (int64_t)Math::floor(p.y / cell), cz = (int64_t)Math::floor(p.z / cell);
++			auto test = [&](int u) {
++				if (tris[u].surf == tris[i].surf) return;
++				if ((closest_on_triangle(p, tris[u].v[0], tris[u].v[1], tris[u].v[2]) - p).length_squared() <= g2) { mark(i); mark(u); }
++			};
++			auto it = grid.find(key(cx, cy, cz));
++			if (it != grid.end()) for (int u : it->second) test(u);
++			for (int u : large) test(u);
++		}
++	}
++}
++
++// The ratio is the TARGET; p_max_error (world metres, 0 = off) is the GUARD: a level whose geometric error exceeds it is refused
++// and the coarsest level within it is kept. Layered shells (a label 1 mm over a body) are simplified independently, so a body
++// level that drifts more than the gap pokes through the shell (e.g. an extinguisher asset at 25 %). p_world_scale converts the
++// mesh's local units (lod.distance = meshopt error * mesh extent) to metres.
++Ref<ImporterMesh> simplify_importer_mesh(const Ref<ImporterMesh> &p_mesh, double p_ratio, double p_max_error, double p_world_scale, const std::vector<PackedByteArray> *p_flags = nullptr) {
++	if (p_ratio <= 0.0 || p_ratio >= 1.0 || p_mesh.is_null() || p_mesh->get_blend_shape_count() > 0) {
++		return p_mesh;   // skinned / blend-shape meshes keep their topology
++	}
++	// the WORK mesh: each surface's index buffer holds only its FREE triangles (shell lock); its open boundary is locked by
++	// generate_lods' SIMPLIFY_LOCK_BORDER, and the near-shell triangles rejoin untouched after the pick
++	Ref<ImporterMesh> work = p_mesh;
++	std::vector<PackedInt32Array> near_idx(p_mesh->get_surface_count());
++	if (p_flags != nullptr) {
++		work.instantiate();
++		work->set_name(p_mesh->get_name());
++		for (int s = 0; s < p_mesh->get_surface_count(); s++) {
++			Array arrays = p_mesh->get_surface_arrays(s);
++			const PackedInt32Array idx = arrays[Mesh::ARRAY_INDEX];
++			if (s < (int)p_flags->size() && (*p_flags)[s].size() * 3 == idx.size() && p_mesh->get_surface_primitive_type(s) == Mesh::PRIMITIVE_TRIANGLES) {
++				const PackedByteArray &fl = (*p_flags)[s];
++				PackedInt32Array free_i;
++				for (int t = 0; t < fl.size(); t++) {
++					PackedInt32Array &dst = fl[t] ? near_idx[s] : free_i;
++					dst.push_back(idx[t * 3]); dst.push_back(idx[t * 3 + 1]); dst.push_back(idx[t * 3 + 2]);
++				}
++				if (free_i.is_empty()) {
++					near_idx[s] = PackedInt32Array();   // all near: the surface keeps every triangle via the full base
++				} else {
++					arrays[Mesh::ARRAY_INDEX] = free_i;
++				}
++			}
++			work->add_surface(p_mesh->get_surface_primitive_type(s), arrays, TypedArray<Array>(), Dictionary(), p_mesh->get_surface_material(s), p_mesh->get_surface_name(s), 0);
++		}
++	}
++	work->generate_lods(60.0, 25.0, Array());
++	Ref<ImporterMesh> out;
++	out.instantiate();
++	out->set_name(p_mesh->get_name());
++	for (int s = 0; s < p_mesh->get_surface_count(); s++) {
++		Array arrays = p_mesh->get_surface_arrays(s);
++		const PackedInt32Array base = work->get_surface_arrays(s)[Mesh::ARRAY_INDEX];   // the free set (or all)
++		PackedInt32Array pick = base;
++		if (p_mesh->get_surface_primitive_type(s) == Mesh::PRIMITIVE_TRIANGLES && base.size() > 0) {
++			for (int l = 0; l < work->get_surface_lod_count(s); l++) {
++				const PackedInt32Array li = work->get_surface_lod_indices(s, l);
++				if (li.size() == 0) {
++					continue;
++				}
++				if (p_max_error > 0.0 && work->get_surface_lod_size(s, l) * p_world_scale > p_max_error) {
++					break;   // levels are sorted by error: every coarser one fails the guard too
++				}
++				pick = li;   // the coarsest level so far within the guard
++				if (li.size() <= int(base.size() * p_ratio)) {
++					break;
++				}
++			}
++		}
++		if (!near_idx[s].is_empty()) {
++			pick.append_array(near_idx[s]);   // the near-shell triangles, as authored
++		}
++		const PackedInt32Array full = arrays[Mesh::ARRAY_INDEX];
++		Array compacted = pick.size() == full.size() ? arrays : compact_surface_arrays(arrays, pick);
++		out->add_surface(p_mesh->get_surface_primitive_type(s), compacted, TypedArray<Array>(), Dictionary(), p_mesh->get_surface_material(s), p_mesh->get_surface_name(s), 0);
++	}
++	return out;
++}
++
++// hand Godot's import pipeline ImporterMeshInstance3D nodes, as the glTF / FBX
++// importers do, so ResourceImporterScene applies LOD generation, mesh compression and shadow meshes to a baked USD scene.
++Node *to_importer_mesh_instances_recursive(Node *p_node, double p_ratio, double p_max_error) {
++	for (int i = p_node->get_child_count() - 1; i >= 0; i--) {
++		to_importer_mesh_instances_recursive(p_node->get_child(i), p_ratio, p_max_error);
++	}
++	MeshInstance3D *mi = Object::cast_to<MeshInstance3D>(p_node);
++	if (mi == nullptr) {
++		return p_node;
++	}
++	Ref<ArrayMesh> am = mi->get_mesh();
++	if (am.is_null()) {
++		return p_node;
++	}
++	Ref<ImporterMesh> im;
++	im.instantiate();
++	im->set_name(am->get_name());
++	for (int b = 0; b < am->get_blend_shape_count(); b++) {
++		im->add_blend_shape(am->get_blend_shape_name(b));
++	}
++	im->set_blend_shape_mode((Mesh::BlendShapeMode)am->get_blend_shape_mode());
++	for (int s = 0; s < am->get_surface_count(); s++) {
++		Ref<Material> mat = mi->get_surface_override_material(s);
++		if (mat.is_null()) {
++			mat = am->surface_get_material(s);
++		}
++		im->add_surface(am->surface_get_primitive_type(s), am->surface_get_arrays(s), am->surface_get_blend_shape_arrays(s), Dictionary(), mat, am->surface_get_name(s), 0);
++	}
++	ImporterMeshInstance3D *imi = memnew(ImporterMeshInstance3D);
++	imi->set_name(mi->get_name());
++	imi->set_transform(mi->get_transform());
++	imi->set_visible(mi->is_visible());
++	double world_scale = 1.0;   // the node chain's largest axis scale, so the error guard reads in metres
++	{
++		Transform3D xf;
++		for (Node *n = mi; n != nullptr; n = n->get_parent()) {
++			if (Node3D *n3 = Object::cast_to<Node3D>(n)) {
++				xf = n3->get_transform() * xf;
++			}
++		}
++		const Vector3 sc = xf.basis.get_scale_abs();
++		world_scale = MAX(sc.x, MAX(sc.y, sc.z));
++	}
++	auto fl = g_shell_flags.find(mi->get_instance_id());
++	imi->set_mesh(simplify_importer_mesh(weld_importer_mesh(im), p_ratio, p_max_error, world_scale, fl != g_shell_flags.end() ? &fl->second : nullptr));   // the base-mesh budget
++	imi->set_skin(mi->get_skin());
++	imi->set_skeleton_path(mi->get_skeleton_path());
++	List<StringName> metas;
++	TypedArray<StringName> meta_list = mi->get_meta_list();
++	for (int k = 0; k < meta_list.size(); k++) {
++		imi->set_meta(meta_list[k], mi->get_meta(meta_list[k]));
++	}
++	Node *parent = mi->get_parent();
++	if (parent != nullptr) {
++		const int idx = mi->get_index();
++		parent->remove_child(mi);
++		parent->add_child(imi);
++		parent->move_child(imi, idx);
++		while (mi->get_child_count() > 0) {
++			Node *c = mi->get_child(0);
++			mi->remove_child(c);
++			imi->add_child(c);
++		}
++	}
++	memdelete(mi);
++	return imi;
++}
++
++
++// an EditorSceneFormatImporter's tree must OWN its descendants (as GLTFDocument::generate_scene does), or
++// ResourceImporterScene packs only the root and the bake is an empty Node3D.
++void set_owner_recursive(Node *p_node, Node *p_owner) {
++	for (int i = 0; i < p_node->get_child_count(); i++) {
++		Node *c = p_node->get_child(i);
++		c->set_owner(p_owner);
++		set_owner_recursive(c, p_owner);
++	}
++}
++
++// the loader adds a preview WorldEnvironment + sun (usd:preview_only) when the stage authors no lights; a BAKED
++// asset must not carry them (they rode into the GLB as KHR_lights_punctual and would light the scene the asset is placed in).
++void strip_preview_nodes_recursive(Node *p_node) {
++	for (int i = p_node->get_child_count() - 1; i >= 0; i--) {
++		Node *c = p_node->get_child(i);
++		const Dictionary md = godot_usd::get_usd_metadata(c);
++		if (md.has("usd:preview_only") && bool(md["usd:preview_only"])) {
++			p_node->remove_child(c);
++			memdelete(c);
++			continue;
++		}
++		strip_preview_nodes_recursive(c);
++	}
++}
++
++UsdStageInstance *find_stage_instance(Node *p_node) {
++	UsdStageInstance *si = Object::cast_to<UsdStageInstance>(p_node);
++	if (si != nullptr) {
++		return si;
++	}
++	for (int i = 0; i < p_node->get_child_count(); i++) {
++		UsdStageInstance *found = find_stage_instance(p_node->get_child(i));
++		if (found != nullptr) {
++			return found;
++		}
++	}
++	return nullptr;
++}
++
+ void clear_generated_root_marker_recursive(Node *p_node) {
+ 	ERR_FAIL_NULL(p_node);
+ 	if (p_node->has_meta(StringName(USD_STAGE_INSTANCE_GENERATED_META))) {
+@@ -258,6 +640,7 @@ Object *UsdSceneFormatImporter::_import_scene(const String &p_path, uint32_t p_f
+ 	}
+ 	variant_selections = merge_variant_selection_dicts(variant_selections, collect_variant_selections_from_structured_options(p_options));
+ 
++	godot_usd::usd_udim_cache_clear();   // UDIM atlases are shared within ONE import
+ 	Ref<Resource> loaded = ResourceLoader::get_singleton()->load(p_path, "PackedScene", ResourceLoader::CACHE_MODE_IGNORE);
+ 	Ref<PackedScene> packed_scene = loaded;
+ 	if (packed_scene.is_null()) {
+@@ -267,10 +650,14 @@ Object *UsdSceneFormatImporter::_import_scene(const String &p_path, uint32_t p_f
+ 	Node *root = packed_scene->instantiate();
+ 	ERR_FAIL_NULL_V(root, nullptr);
+ 
+-	UsdStageInstance *stage_instance = Object::cast_to<UsdStageInstance>(root);
++	UsdStageInstance *stage_instance = find_stage_instance(root);   // the loader may wrap the stage instance (preview env / light)
+ 	if (stage_instance == nullptr) {
+ 		return root;
+ 	}
++	if (stage_instance != root) {
++		stage_instance->get_parent()->remove_child(stage_instance);
++		memdelete(root);   // the wrapper (preview environment + light) is not part of the asset
++	}
+ 
+ 	if (!variant_selections.is_empty()) {
+ 		stage_instance->set_variant_selections(variant_selections);
+@@ -297,10 +684,20 @@ Object *UsdSceneFormatImporter::_import_scene(const String &p_path, uint32_t p_f
+ 		}
+ 	}
+ 	memdelete(stage_instance);
++	const double simplify_ratio = p_options.has("usd/simplify_ratio") ? double(p_options["usd/simplify_ratio"]) : 1.0;
++	const double simplify_max_error = p_options.has("usd/simplify_max_error") ? double(p_options["usd/simplify_max_error"]) : 0.0;
++	strip_preview_nodes_recursive(generated_root);
++	compute_shell_flags(generated_root, p_options.has("usd/simplify_shell_lock") ? double(p_options["usd/simplify_shell_lock"]) : 0.0);
++	to_importer_mesh_instances_recursive(generated_root, simplify_ratio, simplify_max_error);
++	g_shell_flags.clear();   // the bake goes through Godot's mesh import pipeline
++	set_owner_recursive(generated_root, generated_root);   // or only the root is packed
+ 	return generated_root;
+ }
+ 
+ void UsdSceneFormatImporter::_get_import_options(const String &p_path) {
++	add_import_option("usd/simplify_ratio", 1.0);   // 1 = off; 0.25 = the base mesh at ~25 % of its triangles
++	add_import_option("usd/simplify_max_error", 0.0);
++	add_import_option("usd/simplify_shell_lock", 0.0);   // metres; 0 = off; triangles this close to another surface stay as authored
+ 	add_import_option_advanced(Variant::STRING, USD_IMPORT_OPTION_VARIANT_SELECTIONS, String(), PROPERTY_HINT_NONE, String(), PROPERTY_USAGE_NO_EDITOR);
+ 	if (p_path.is_empty()) {
+ 		return;
