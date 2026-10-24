@@ -110,3 +110,12 @@ def test_dedupe_shares_identical_images():
         assert (st['images_in'], st['images_out'], st['textures_out']) == (2, 1, 1)
         g = G.Glb.load(dst)
         assert all(m['pbrMetallicRoughness']['baseColorTexture']['index'] == 0 for m in g.json['materials'])
+
+
+def test_report_encoder_takes_numpy_scalars():
+    """The bake's JSON report carries numpy scalars from the measurement passes (np.bool_ from a numpy comparison is not
+    JSON serialisable and aborted a real bake after all its work); the encoder hands them over as Python values."""
+    import json
+    from gamebake.bake import _json_default
+    r = json.loads(json.dumps({'ok': np.bool_(True), 'pct': np.float64(1.5), 'tris': np.int64(3)}, default=_json_default))
+    assert r == {'ok': True, 'pct': 1.5, 'tris': 3} and type(r['ok']) is bool

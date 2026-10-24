@@ -26,6 +26,13 @@ MAX_SMEAR_INCREASE = 2.0       # percentage points of area with UV error > 4 tex
 MAX_PENETRATION_INCREASE = 1.0  # percentage points of a layered shell pushed through the surface under it
 
 
+def _json_default(o):
+    """The report's encoder fallback: numpy scalars from the measurement passes (np.bool_, np.float64, np.int64) as Python values."""
+    if hasattr(o, 'item'):
+        return o.item()
+    raise TypeError('Object of type %s is not JSON serializable' % type(o).__name__)
+
+
 def _run(cmd, timeout):
     t0 = time.time()
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -138,7 +145,7 @@ def bake(usd, project, out, godot, ratios=(1.0, 0.5, 0.25, 0.12), shell_lock=0.0
         report['final'] = {'glb': os.path.basename(final), 'tris': pick['tris'], 'mb': pick['mb']}
     report['final']['of_full_pct'] = round(100 * report['final']['tris'] / s0['tris'])
     with open(os.path.join(out, stem + '.report.json'), 'w') as f:
-        json.dump(report, f, indent=1)
+        json.dump(report, f, indent=1, default=_json_default)
     log('%s: full %d tris -> pick r%s %d tris -> final %d tris (%d%% of full), %.2f MB' % (
         stem, s0['tris'], pick['ratio'], pick['tris'], report['final']['tris'], report['final']['of_full_pct'], report['final']['mb']))
     return report
