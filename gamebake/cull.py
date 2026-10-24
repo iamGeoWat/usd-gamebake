@@ -6,7 +6,8 @@ own centroid per direction, which is exact per triangle. Transparent materials (
 alpha < 1) never occlude and are never culled, so whatever sits behind glass survives.
 
 Only index buffers change: each culled primitive gets a new index accessor; vertices, attributes, materials, images and
-nodes are kept, and the file is compacted (unreferenced accessors and buffer views dropped).
+nodes are kept, and the file is compacted (unreferenced accessors and buffer views dropped). A fully hidden primitive is
+removed (glTF forbids an empty accessor), and so is a mesh left with none; the nodes that drew it stay, without a mesh.
 """
 import time
 
@@ -99,12 +100,16 @@ def cull(src, dst, ndirs=162, pitch_m=0.0005, seed=3):
         s += n
     new_bin = bytearray(g.bin)
     dropped = total = 0
+    empty = set()
     for (mi, k), kk in keep.items():
         pr = j['meshes'][mi]['primitives'][k]
         idx = g.accessor(pr['indices']).reshape(-1, 3)
         total += len(idx)
         dropped += int((~kk).sum())
         if kk.all():
+            continue
+        if not kk.any():
+            empty.add((mi, k))
             continue
         ik = idx[kk].astype(np.uint32).ravel()
         while len(new_bin) % 4:
@@ -113,7 +118,28 @@ def cull(src, dst, ndirs=162, pitch_m=0.0005, seed=3):
         new_bin += ik.tobytes()
         j['accessors'].append({'bufferView': len(j['bufferViews']) - 1, 'componentType': 5125, 'count': int(len(ik)), 'type': 'SCALAR'})
         pr['indices'] = len(j['accessors']) - 1
+    _drop_empty(j, empty)
     out = G.compact(j, bytes(new_bin))
     size = G.write(dst, j, out)
     return {'file': src, 'tris_in': total, 'tris_out': total - dropped, 'hidden_area_pct': 100 * area[~keep_w].sum() / area.sum(),
             'pitch_mm': 1000 * pitch, 'dirs': ndirs, 'mb_in': g.size / 1e6, 'mb_out': size / 1e6, 'seconds': time.time() - t0}
+
+
+def _drop_empty(j, empty):
+    """Remove every fully hidden primitive (glTF forbids a count-0 accessor), then every mesh left with none: the nodes
+    that drew it lose their mesh, and later mesh indices shift down."""
+    for mi, m in enumerate(j['meshes']):
+        m['primitives'] = [pr for k, pr in enumerate(m['primitives']) if (mi, k) not in empty]
+    live = [mi for mi, m in enumerate(j['meshes']) if m['primitives']]
+    if not live:
+        raise ValueError('cull left no visible primitive')
+    remap = {old: new for new, old in enumerate(live)}
+    j['meshes'] = [j['meshes'][mi] for mi in live]
+    for nd in j['nodes']:
+        if 'mesh' in nd:
+            if nd['mesh'] in remap:
+                nd['mesh'] = remap[nd['mesh']]
+            else:
+                del nd['mesh']
+                nd.pop('skin', None)
+                nd.pop('weights', None)

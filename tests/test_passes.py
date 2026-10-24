@@ -86,7 +86,30 @@ def test_cull_removes_an_enclosed_box():
         assert st['tris_in'] == 24 and st['tris_out'] == 12
         g = G.Glb.load(dst)
         counts = [g.accessor(m['primitives'][0]['indices']).size // 3 for m in g.json['meshes']]
-        assert counts == [12, 0] or counts == [12]
+        assert counts == [12]
+        # glTF 2.0: an accessor's count is >= 1 and a mesh has >= 1 primitive; a fully hidden primitive is dropped, not
+        # written empty (Godot's importer rejects the whole mesh table on a count-0 accessor)
+        assert all(a['count'] >= 1 for a in g.json['accessors'])
+        assert all(len(m['primitives']) >= 1 for m in g.json['meshes'])
+        assert all(n.get('mesh', 0) < len(g.json['meshes']) for n in g.json['nodes'])
+
+
+def test_cull_drops_hidden_primitives_and_remaps_nodes():
+    from gamebake.cull import cull
+    with tempfile.TemporaryDirectory() as d:
+        src, dst = os.path.join(d, 'a.glb'), os.path.join(d, 'b.glb')
+        # mesh 0: outer cube + a hidden inner cube as a second primitive; mesh 1: a hidden cube; mesh 2: a visible cube
+        _write(src, [_cube(1.0) + (None,), _cube(0.2, (0.2, 0.2, 0.2)) + (None,), _cube(0.5, (3.0, 0.0, 0.0)) + (None,)])
+        g = G.Glb.load(src)
+        j = g.json
+        j['meshes'][0]['primitives'].append(dict(j['meshes'][1]['primitives'][0]))
+        G.write(src, j, g.bin)
+        st = cull(src, dst, ndirs=42, pitch_m=0.01)
+        assert st['tris_out'] == 24
+        out = G.Glb.load(dst).json
+        assert [len(m['primitives']) for m in out['meshes']] == [1, 1]
+        assert all(a['count'] >= 1 for a in out['accessors'])
+        assert [n.get('mesh') for n in out['nodes']] == [0, None, 1]
 
 
 def test_shape_flat_grid_is_clean_and_noise_is_crumpled():
