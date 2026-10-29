@@ -67,3 +67,11 @@ are 550 added and 21 removed lines. Every fix was found by comparing bakes again
     exact closest point on the triangle, both sides of the pair.
   - Marked triangles are kept as authored; only the free set is simplified, with its border locked.
   - Without this, a body simplified on its own drifts through the label over it.
+
+## 0006 UDIM cache teardown (`usd_usdz.*`, `register_types.cpp`)
+
+- **No crash at exit.** The 0001 UDIM caches were `thread_local HashMap<String, Ref<Texture2D>>`, destroyed in `exit()`'s
+  thread-local finalizer after Godot had shut down; the `Ref`'s unreference called into the dead engine, so every
+  import step that touched the cache ended in a SIGSEGV and a macOS "quit unexpectedly" report. The caches now live on
+  the heap behind a trivially destructible `thread_local` pointer, every thread's cache is emptied at the extension's
+  SCENE uninitialize while the engine is alive, and the emptied maps are deliberately leaked.

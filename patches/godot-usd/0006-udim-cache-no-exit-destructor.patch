@@ -1,0 +1,111 @@
+diff --git a/src/usd_usdz.cpp b/src/usd_usdz.cpp
+index 1a8c4b5..676b54f 100644
+--- a/src/usd_usdz.cpp
++++ b/src/usd_usdz.cpp
+@@ -1,5 +1,6 @@
+ #include <godot_cpp/templates/hash_map.hpp>
+ #include <pxr/usd/sdf/propertySpec.h>
++#include <mutex>
+ #include <vector>
+ #include <godot_cpp/classes/project_settings.hpp>
+ #include <godot_cpp/classes/resource_loader.hpp>
+@@ -185,16 +186,49 @@ static thread_local Vector2i g_udim_last_grid = Vector2i();
+ Vector2i usd_udim_last_grid() {
+ 	return g_udim_last_grid;
+ }
+-static thread_local HashMap<String, Ref<Texture2D>> g_udim_atlas_cache;   // one atlas per tile pattern
+-static thread_local HashMap<String, Vector2i> g_udim_grid_cache;
++// The per-thread caches live on the heap behind a TRIVIALLY destructible thread_local pointer, and are never
++// destroyed: a thread_local HashMap<String, Ref<Texture2D>> ran its destructor in exit()'s TLV finalizer, after
++// the engine was torn down, and the Ref's unreference called into a dead engine (SIGSEGV at every bake's exit,
++// "godot quit unexpectedly"). usd_udim_cache_release_all() empties every thread's cache at the extension's
++// SCENE uninitialize, while the engine is still alive; the emptied maps are leaked on purpose.
++struct UdimCache {
++	HashMap<String, Ref<Texture2D>> atlas;   // one atlas per tile pattern
++	HashMap<String, Vector2i> grid;
++};
++static std::mutex g_udim_caches_mutex;
++static std::vector<UdimCache *> *g_udim_caches = nullptr;   // every thread's cache; leaked, never destructed
++static thread_local UdimCache *t_udim_cache = nullptr;
++static UdimCache &udim_cache() {
++	if (t_udim_cache == nullptr) {
++		t_udim_cache = new UdimCache();
++		std::lock_guard<std::mutex> lock(g_udim_caches_mutex);
++		if (g_udim_caches == nullptr) {
++			g_udim_caches = new std::vector<UdimCache *>();
++		}
++		g_udim_caches->push_back(t_udim_cache);
++	}
++	return *t_udim_cache;
++}
+ void usd_udim_cache_clear() {
+-	g_udim_atlas_cache.clear();
+-	g_udim_grid_cache.clear();
++	UdimCache &cache = udim_cache();
++	cache.atlas.clear();
++	cache.grid.clear();
++}
++void usd_udim_cache_release_all() {
++	std::lock_guard<std::mutex> lock(g_udim_caches_mutex);
++	if (g_udim_caches == nullptr) {
++		return;
++	}
++	for (UdimCache *cache : *g_udim_caches) {
++		cache->atlas.clear();
++		cache->grid.clear();
++	}
+ }
+ static Ref<Texture2D> load_udim_atlas(const String &p_pattern) {
+-	if (g_udim_atlas_cache.has(p_pattern)) {
+-		g_udim_last_grid = g_udim_grid_cache[p_pattern];
+-		return g_udim_atlas_cache[p_pattern];
++	UdimCache &cache = udim_cache();
++	if (cache.atlas.has(p_pattern)) {
++		g_udim_last_grid = cache.grid[p_pattern];
++		return cache.atlas[p_pattern];
+ 	}
+ 	struct Tile { int u; int v; Ref<Image> img; };
+ 	std::vector<Tile> tiles;
+@@ -228,8 +262,8 @@ static Ref<Texture2D> load_udim_atlas(const String &p_pattern) {
+ 	atlas->generate_mipmaps();
+ 	g_udim_last_grid = Vector2i(cols, rows);
+ 	Ref<Texture2D> tex = ImageTexture::create_from_image(atlas);
+-	g_udim_atlas_cache[p_pattern] = tex;
+-	g_udim_grid_cache[p_pattern] = g_udim_last_grid;
++	cache.atlas[p_pattern] = tex;
++	cache.grid[p_pattern] = g_udim_last_grid;
+ 	return tex;
+ }
+ 
+diff --git a/src/usd_usdz.h b/src/usd_usdz.h
+index 1909615..3b92272 100644
+--- a/src/usd_usdz.h
++++ b/src/usd_usdz.h
+@@ -27,6 +27,7 @@ Ref<Texture2D> texture_from_image(const Ref<Image> &p_image);
+ Ref<Texture2D> load_texture_from_asset_attribute(const UsdStageRefPtr &p_stage, const UsdTimeCode &p_time, const UsdAttribute &p_asset_attribute, String *r_resolved_path = nullptr);
+ godot::Vector2i usd_udim_last_grid();   // the last texture load's UDIM grid (0,0 = not UDIM)
+ void usd_udim_cache_clear();   // clears the per-import UDIM atlas cache
++void usd_udim_cache_release_all();   // empties every thread's UDIM cache; call at SCENE uninitialize, before the engine goes
+ bool is_safe_usdz_member_path(const String &p_member_path);
+ Error extract_usdz_package(const String &p_source_absolute_path, const String &p_destination_directory, String *r_root_layer_path, Vector<String> *r_package_file_paths);
+ Error create_usdz_package_from_extracted_files(const String &p_extracted_directory, const Vector<String> &p_package_file_paths, const String &p_root_layer_path, const String &p_package_path);
+diff --git a/src/register_types.cpp b/src/register_types.cpp
+index 5037247..4d1a384 100644
+--- a/src/register_types.cpp
++++ b/src/register_types.cpp
+@@ -12,6 +12,7 @@
+ #include "usd_light_proxy.h"
+ #include "usd_scene_importer.h"
+ #include "usd_scene_loader.h"
++#include "usd_usdz.h"
+ 
+ using namespace godot;
+ 
+@@ -43,6 +44,7 @@ void initialize_godot_usd_module(ModuleInitializationLevel p_level) {
+ 
+ void uninitialize_godot_usd_module(ModuleInitializationLevel p_level) {
+ 	if (p_level == MODULE_INITIALIZATION_LEVEL_SCENE) {
++		godot_usd::usd_udim_cache_release_all();   // the cached atlases (Ref<Texture2D>) go while the engine is alive
+ 		if (s_usd_loader.is_valid()) {
+ 			ResourceLoader::get_singleton()->remove_resource_format_loader(s_usd_loader);
+ 			s_usd_loader.unref();
